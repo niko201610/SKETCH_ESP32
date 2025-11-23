@@ -51,6 +51,20 @@ Preferences prefs;
 WebServer server(80);
 int currentPageIndex = 1;
 
+// -------- CASIO-inspired theme (tweakable) --------
+// LCD-like palette and spacing for quick styling updates.
+const uint16_t COLOR_BG         = TFT_BLACK;                      // main background
+const uint16_t COLOR_GRID       = TFT_DARKGREY;                   // separators / matrix feel
+const uint16_t COLOR_TEXT_MAIN  = TFT_GREEN;                      // primary mono-like text
+const uint16_t COLOR_TEXT_SOFT  = tft.color565(120, 210, 180);    // secondary text
+const uint16_t COLOR_ACCENT     = tft.color565(0, 170, 120);      // buttons / highlights
+const uint16_t COLOR_ACCENT_2   = tft.color565(0, 120, 180);      // alternate accent
+const uint16_t COLOR_FRAME      = tft.color565(30, 60, 60);       // subtle frame lines
+const uint16_t COLOR_BUTTON_BG  = tft.color565(10, 30, 30);
+const uint16_t COLOR_STATUS_BG  = tft.color565(8, 16, 16);
+const int THEME_RADIUS = 6;
+const int THEME_PADDING = 6;
+
 
 // virtual canvas
 const int V_W = 320;
@@ -69,7 +83,7 @@ float map_scale_y = (float)115.0f / 4096.0f;
 float map_offset_y = 0.0f;
 bool calibrated = false;
 
-enum Screen { HOME, COUNTER };
+enum Screen { HOME, COUNTER, IMAGE_VIEWER };
 Screen screen = HOME;
 int counterValue = 0;
 
@@ -96,6 +110,8 @@ struct Rect { int x, y, w, h; };
 Rect btnRun, btnCounter, btnPlus, btnMinus, btnNumber, btnCalibrate; // --- Pegar UNA SOLA VEZ junto a las otras declaraciones Rect (btnPlus/btnMinus/btnRun etc.) ---
 Rect btnLeftZone;
 Rect btnRightZone;
+Rect btnImageMode;
+Rect btnImgBack, btnImgReset;
 
 // ---- Control de bloqueo / desbloqueo y long-press para volver a HOME ----
 bool homeButtonsLocked = false; // Ya no usamos "mantener presionado" para desbloquear
@@ -135,6 +151,15 @@ const unsigned long CURSOR_TTL = 450; // ms
 
 // long-press detection (raw)
 const unsigned long LONG_PRESS_MS = 1500;
+
+// Image viewer state
+String currentImagePath = "/page_001.jpg"; // default fallback
+int lastImgW = 0, lastImgH = 0;
+int imgOffsetX = 0, imgOffsetY = 0;
+unsigned long lastPanRedrawMs = 0;
+bool isPanningImage = false;
+int panStartX = 0, panStartY = 0;
+int panLastX = 0, panLastY = 0;
 
 // ---------- helpers virtual -> real ----------
 int vX(int vx) {
@@ -471,9 +496,46 @@ bool ptInRectPad(int x, int y, Rect r, int pad) {
       && y >= (r.y - pad) && y < (r.y + r.h + pad);
 }
 
+uint16_t blendColor(uint16_t c, int delta) {
+  int r = ((c >> 11) & 0x1F) << 3;
+  int g = ((c >> 5) & 0x3F) << 2;
+  int b = (c & 0x1F) << 3;
+  r = constrain(r + delta, 0, 255);
+  g = constrain(g + delta, 0, 255);
+  b = constrain(b + delta, 0, 255);
+  return tft.color565(r, g, b);
+}
+
+void drawMiniSpinner(int cx, int cy, int radius, int step) {
+  const int segs = 8;
+  tft.fillCircle(cx, cy, radius + 2, COLOR_BG);
+  for (int i = 0; i < segs; ++i) {
+    float ang = (float)(i + step) / segs * TWO_PI;
+    int x0 = cx + cos(ang) * (radius - 4);
+    int y0 = cy + sin(ang) * (radius - 4);
+    int x1 = cx + cos(ang) * radius;
+    int y1 = cy + sin(ang) * radius;
+    uint16_t c = (i == (step % segs)) ? COLOR_ACCENT : COLOR_FRAME;
+    tft.drawLine(x0, y0, x1, y1, c);
+  }
+}
+
+void drawCasioFrame(Rect area, const char* title = NULL) {
+  tft.fillRect(area.x, area.y, area.w, area.h, COLOR_BG);
+  tft.drawRect(area.x, area.y, area.w, area.h, COLOR_FRAME);
+  for (int y = area.y + 18; y < area.y + area.h; y += 18) {
+    tft.drawLine(area.x + 1, y, area.x + area.w - 2, y, COLOR_GRID);
+  }
+  if (title) {
+    tft.setTextColor(COLOR_TEXT_SOFT, COLOR_BG);
+    tft.setTextSize(1);
+    tft.drawCentreString(title, area.x + area.w / 2, area.y + 2, 1);
+  }
+}
+
 void drawStyledButton(Rect r, const char* label, int radius, uint16_t bgColor, uint16_t textColor) {
   tft.fillRoundRect(r.x, r.y, r.w, r.h, radius, bgColor);
-  tft.drawRoundRect(r.x, r.y, r.w, r.h, radius, tft.color565(255,255,255));
+  tft.drawRoundRect(r.x, r.y, r.w, r.h, radius, COLOR_FRAME);
   int tsz = chooseTextSizeToFit(label, r, 3, 8);
   tft.setTextColor(textColor, bgColor);
   tft.setTextSize(tsz);
@@ -524,19 +586,21 @@ void flashButtonLocal(Rect r, const char* label, uint16_t origColor) {
     int cy = r.y + r.h/2;
     int rad = min(r.w, r.h)/2 - 2;
     if (rad < 8) rad = min(r.w, r.h)/2;
-    tft.fillCircle(cx, cy, rad, TFT_WHITE);
+    uint16_t hl = blendColor(origColor, 40);
+    tft.fillCircle(cx, cy, rad, hl);
     tft.setTextSize(1);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setTextColor(TFT_BLACK, hl);
     tft.drawCentreString(label, cx, cy - 6, 1);
-    delay(60);
+    delay(40);
     drawCircleButton(r, label, origColor);
   } else {
     int radius = min(12, r.h/2);
-    tft.fillRoundRect(r.x, r.y, r.w, r.h, radius, TFT_WHITE);
+    uint16_t hl = blendColor(origColor, 40);
+    tft.fillRoundRect(r.x, r.y, r.w, r.h, radius, hl);
     tft.setTextSize(1);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setTextColor(TFT_BLACK, hl);
     tft.drawCentreString(label, r.x + r.w/2, r.y + r.h/2 - 4, 1);
-    delay(60);
+    delay(40);
     redrawButton(r, label, origColor);
   }
 }
@@ -546,40 +610,56 @@ void handlePrev();   // handler que ya registraste con server.on("/prev", ...)
 
 
 void connectWiFi() {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE); tft.setTextSize(1);
+  tft.fillScreen(COLOR_BG);
+  tft.setTextColor(COLOR_TEXT_MAIN); tft.setTextSize(1);
   tft.drawCentreString("Conectando WiFi...", tft.width()/2, tft.height()/2 - 10, 1);
   WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 12000) { delay(300); Serial.print("."); server.handleClient(); }
+  int step = 0;
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 12000) {
+    delay(250); Serial.print("."); server.handleClient();
+    drawMiniSpinner(tft.width()/2, tft.height()/2 + 12, 12, step++);
+  }
   Serial.println();
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("WiFi conectado!");
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(COLOR_BG);
     tft.drawCentreString("WiFi conectado!", tft.width()/2, tft.height()/2 - 10, 1);
         // justo después de WiFi conectado:
     sendIpToAutoRemote();   // envía la IP a MacroDroid/AutoRemote al conectarse
 
   } else {
     Serial.println("WiFi fallo");
-    tft.fillScreen(TFT_BLACK);
+    tft.fillScreen(COLOR_BG);
     tft.drawCentreString("WiFi fallo", tft.width()/2, tft.height()/2 - 10, 1);
   }
   delay(600);
 }
 
 
-// drawHome (simple, sin textos explicativos)
+// drawHome con estilo Casio
 void drawHome() {
   screen = HOME;
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextSize(2); tft.setTextColor(TFT_WHITE);
-  // titulo
-  tft.drawCentreString("", tft.width()/2, vY(6), 1);
+  tft.fillScreen(COLOR_BG);
 
-  // Solo RUN y Contador (sin Calibrar)
-  redrawButton(btnRun, "PC", colRun);
-  redrawButton(btnCounter, "PREG", colCounter);
+  Rect titleArea = {0, 0, tft.width(), 26};
+  drawCasioFrame(titleArea, "HOME");
+  tft.setTextColor(COLOR_TEXT_SOFT, COLOR_BG);
+  tft.setTextSize(1);
+  tft.drawString("MODE", THEME_PADDING, 4);
+  tft.setTextColor(COLOR_TEXT_MAIN, COLOR_BG);
+  tft.drawRightString(WiFi.localIP().toString(), tft.width() - THEME_PADDING, 4, 1);
+
+  Rect gridArea = {THEME_PADDING, titleArea.h + 4, tft.width() - THEME_PADDING * 2, tft.height() - titleArea.h - 16};
+  drawCasioFrame(gridArea, "SELECT");
+
+  redrawButton(btnRun, "PC", COLOR_ACCENT);
+  redrawButton(btnCounter, "PREG", COLOR_ACCENT_2);
+  redrawButton(btnImageMode, "IMG", COLOR_BUTTON_BG);
+
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT_SOFT, COLOR_BG);
+  tft.drawString("Tap to enter mode", THEME_PADDING + 2, gridArea.y + gridArea.h - 14, 1);
 }
 
 
@@ -650,8 +730,9 @@ void drawLongPressProgressAt(int sx, int sy, float frac) {
 uint16_t getBackgroundColorForScreen() {
   // devuelve un color razonable para borrar la barra dependiendo de la pantalla
   // Ajusta estos colores segun tu paleta y otras pantallas que tengas.
-  if (screen == HOME) return TFT_BLACK;           // ajusta si tu HOME tiene otro fondo
-  if (screen == COUNTER) return colNumberBg;      // usa color de la caja numerica
+  if (screen == HOME) return COLOR_BG;           // ajusta si tu HOME tiene otro fondo
+  if (screen == COUNTER) return COLOR_STATUS_BG;      // usa color de la caja numerica
+  if (screen == IMAGE_VIEWER) return COLOR_BG;
   // Ejemplo si tienes una pantalla RENDER con fondo claro:
   // if (screen == RENDER) return tft.color565(245,245,245);
   // Añade condiciones para otras pantallas con fondos especificos
@@ -692,36 +773,104 @@ void updateNumberDisplay(); // forward
 
 void drawCounterFull() {
   screen = COUNTER;
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(COLOR_BG);
 
-  tft.setTextSize(2); tft.setTextColor(TFT_WHITE);
-  tft.drawCentreString("Contador", tft.width()/2, vY(6), 1);
+  Rect titleArea = {0, 0, tft.width(), 26};
+  drawCasioFrame(titleArea, "COUNTER");
+  tft.setTextColor(COLOR_TEXT_SOFT, COLOR_BG);
+  tft.setTextSize(1);
+  tft.drawString("CONT", THEME_PADDING, 4);
 
-  // botones +/- y caja numero
-  redrawButton(btnMinus, "-", colMinus);
-  redrawButton(btnPlus, "+", colPlus);
+  redrawButton(btnMinus, "-", COLOR_BUTTON_BG);
+  redrawButton(btnPlus, "+", COLOR_BUTTON_BG);
 
-  // caja numerica (fondo oscuro con borde)
-  tft.fillRoundRect(btnNumber.x, btnNumber.y, btnNumber.w, btnNumber.h, 8, colNumberBg);
-  tft.drawRoundRect(btnNumber.x, btnNumber.y, btnNumber.w, btnNumber.h, 8, tft.color565(255,255,255));
+  tft.fillRoundRect(btnNumber.x, btnNumber.y, btnNumber.w, btnNumber.h, THEME_RADIUS, COLOR_STATUS_BG);
+  tft.drawRoundRect(btnNumber.x, btnNumber.y, btnNumber.w, btnNumber.h, THEME_RADIUS, COLOR_FRAME);
 
-  // dibuja numero centrado
   updateNumberDisplay();
 }
 
 // ACTUALIZA SOLO LA CAJA DEL NUMERO (evita redraw completo)
 void updateNumberDisplay() {
-  tft.fillRoundRect(btnNumber.x + 1, btnNumber.y + 1, btnNumber.w - 2, btnNumber.h - 2, 8, colNumberBg);
+  tft.fillRoundRect(btnNumber.x + 1, btnNumber.y + 1, btnNumber.w - 2, btnNumber.h - 2, THEME_RADIUS, COLOR_STATUS_BG);
   char numbuf[32];
   snprintf(numbuf, sizeof(numbuf), "%d", counterValue);
   int tsz = chooseTextSizeToFit(numbuf, btnNumber, 4, 12);
   tft.setTextSize(tsz);
-  tft.setTextColor(TFT_WHITE);
+  tft.setTextColor(COLOR_TEXT_MAIN, COLOR_STATUS_BG);
   int cx = btnNumber.x + btnNumber.w/2;
   int cy = btnNumber.y + btnNumber.h/2;
   int approxCharHeight = tsz * 8;
   int yOff = (approxCharHeight / 2) - 2;
   tft.drawCentreString(String(counterValue), cx, cy - yOff, 1);
+}
+
+// IMAGE VIEWER UI
+void drawImageViewer(bool showHint = true) {
+  screen = IMAGE_VIEWER;
+  clampImageOffsets();
+  displayJpgFile(currentImagePath.c_str(), imgOffsetX, imgOffsetY, false);
+
+  // overlay UI
+  tft.fillRoundRect(btnImgBack.x, btnImgBack.y, btnImgBack.w, btnImgBack.h, THEME_RADIUS, COLOR_BUTTON_BG);
+  tft.drawRoundRect(btnImgBack.x, btnImgBack.y, btnImgBack.w, btnImgBack.h, THEME_RADIUS, COLOR_FRAME);
+  tft.setTextColor(COLOR_TEXT_SOFT, COLOR_BUTTON_BG); tft.setTextSize(1);
+  tft.drawCentreString("HOME", btnImgBack.x + btnImgBack.w/2, btnImgBack.y + 6, 1);
+
+  tft.fillRoundRect(btnImgReset.x, btnImgReset.y, btnImgReset.w, btnImgReset.h, THEME_RADIUS, COLOR_BUTTON_BG);
+  tft.drawRoundRect(btnImgReset.x, btnImgReset.y, btnImgReset.w, btnImgReset.h, THEME_RADIUS, COLOR_FRAME);
+  tft.setTextColor(COLOR_TEXT_SOFT, COLOR_BUTTON_BG);
+  tft.drawCentreString("CENTER", btnImgReset.x + btnImgReset.w/2, btnImgReset.y + 6, 1);
+
+  if (showHint) {
+    tft.setTextColor(COLOR_TEXT_SOFT, COLOR_BG);
+    tft.setTextSize(1);
+    tft.drawCentreString("Arrastra para mover", tft.width()/2, tft.height() - 18, 1);
+  }
+
+  tft.setTextColor(COLOR_TEXT_MAIN, COLOR_BG);
+  tft.drawCentreString(String(imgOffsetX) + "," + String(imgOffsetY), tft.width()/2, 4, 1);
+}
+
+void handleImageViewerTouch() {
+  server.handleClient();
+  if (!ts.touched()) { isPanningImage = false; delay(6); return; }
+  TS_Point p = ts.getPoint();
+  int sx, sy; mapRawToScreen(p.x, p.y, sx, sy);
+
+  if (ptInRectInner(sx, sy, btnImgBack, 4)) {
+    flashButtonLocal(btnImgBack, "HOME", COLOR_BUTTON_BG);
+    drawHome();
+    while (ts.touched()) { server.handleClient(); delay(6); }
+    return;
+  }
+  if (ptInRectInner(sx, sy, btnImgReset, 4)) {
+    imgOffsetX = imgOffsetY = 0; clampImageOffsets();
+    flashButtonLocal(btnImgReset, "CENTER", COLOR_BUTTON_BG);
+    drawImageViewer();
+    while (ts.touched()) { server.handleClient(); delay(6); }
+    return;
+  }
+
+  if (!isPanningImage) {
+    isPanningImage = true;
+    panStartX = panLastX = sx;
+    panStartY = panLastY = sy;
+  }
+
+  int dx = sx - panLastX;
+  int dy = sy - panLastY;
+  panLastX = sx; panLastY = sy;
+  if (dx != 0 || dy != 0) {
+    imgOffsetX += dx;
+    imgOffsetY += dy;
+    clampImageOffsets();
+    unsigned long now = millis();
+    if (now - lastPanRedrawMs > 35) { // ajusta para velocidad de arrastre
+      drawImageViewer(false);
+      lastPanRedrawMs = now;
+    }
+  }
 }
 
 // ---------- HTTP helpers ----------
@@ -1170,19 +1319,20 @@ void doPrevPage() {
 // ---------- RECTS helper ----------
 void recomputeRects() {
   // Layout: dos botones centrados (RUN | Contador) con menor tamaño
-  const int btnW = 90;    // ancho reducido
+  const int btnW = 82;    // ancho reducido
   const int btnH = 28;    // alto reducido
-  const int spacing = 18; // separacion entre botones
+  const int spacing = 12; // separacion entre botones
 
-  int totalW = btnW * 2 + spacing;
+  int totalW = btnW * 3 + spacing * 2;
   int startX = (V_W - totalW) / 2;
 
   // Posicion vertical (igual que antes para mantener diseño)
   int vyBtns = 74;
 
   // Botones principales centrados y mas pequeños
-  btnRun     = vRectMin(startX, vyBtns, btnW, btnH, 48);
-  btnCounter = vRectMin(startX + btnW + spacing, vyBtns, btnW, btnH, 48);
+  btnRun       = vRectMin(startX, vyBtns, btnW, btnH, 48);
+  btnCounter   = vRectMin(startX + btnW + spacing, vyBtns, btnW, btnH, 48);
+  btnImageMode = vRectMin(startX + (btnW + spacing) * 2, vyBtns, btnW, btnH, 48);
 
   // Ocultar/eliminar Calibrar
   btnCalibrate = { 0, 0, 0, 0 };
@@ -1196,6 +1346,10 @@ void recomputeRects() {
   const int widthSide = 72;
   btnLeftZone  = vRectMin(0, 0, widthSide, V_H, 28);
   btnRightZone = vRectMin(V_W - widthSide, 0, widthSide, V_H, 28);
+
+  // Controles del visor de imagen
+  btnImgBack  = vRectMin(10, 10, 68, 26, 40);
+  btnImgReset = vRectMin(V_W - 78, 10, 68, 26, 40);
 }
 
 
@@ -1209,6 +1363,20 @@ uint16_t hexTo565(const char *hex) {
   return (uint16_t)((r & 0xF8) << 8) | (uint16_t)((g & 0xFC) << 3) | (uint16_t)(b >> 3);
 }
 
+void clampImageOffsets() {
+  if (lastImgW == 0 || lastImgH == 0) return;
+  int baseX = (displayBaseMode == 0) ? (tft.width() - lastImgW) / 2 : 0;
+  int baseY = (displayBaseMode == 0) ? (tft.height() - lastImgH) / 2 : 0;
+  int minX = tft.width() - (baseX + lastImgW);
+  int maxX = -baseX;
+  int minY = tft.height() - (baseY + lastImgH);
+  int maxY = -baseY;
+  if (minX > maxX) { minX = maxX = 0; }
+  if (minY > maxY) { minY = maxY = 0; }
+  imgOffsetX = constrain(imgOffsetX, minX, maxX);
+  imgOffsetY = constrain(imgOffsetY, minY, maxY);
+}
+
 void displayJpgFile(const char *path, int xOffset = 0, int yOffset = 0, bool useDefaults = true) {
   if (!SPIFFS.exists(path)) {
     Serial.printf("⚠️ No existe el archivo JPG: %s\n", path);
@@ -1220,6 +1388,7 @@ void displayJpgFile(const char *path, int xOffset = 0, int yOffset = 0, bool use
   }
   int imgW = JpegDec.width;
   int imgH = JpegDec.height;
+  lastImgW = imgW; lastImgH = imgH; currentImagePath = path;
   Serial.printf("✅ Imagen decodificada: %dx%d. Mostrando (swapBytes=true)...\n", imgW, imgH);
 
   int finalX = xOffset;
@@ -1228,7 +1397,9 @@ void displayJpgFile(const char *path, int xOffset = 0, int yOffset = 0, bool use
     finalX = displayDefaultX;
     finalY = displayDefaultY;
   }
-  uint16_t screenBg = hexTo565("000000");
+  clampImageOffsets();
+
+  uint16_t screenBg = COLOR_BG;
   tft.fillScreen(screenBg);
   tft.setSwapBytes(true);
 
@@ -2032,6 +2203,7 @@ void handleUpload() {
       if (uploadFile) {
         uploadFile.close();
         Serial.printf("✅ Archivo %s recibido, mostrando...\n", currentFilenameUpload.c_str());
+        imgOffsetX = imgOffsetY = 0; clampImageOffsets();
         displayJpgFile(currentFilenameUpload.c_str());
       }
       server.sendHeader("Location", "/");
@@ -2167,8 +2339,11 @@ void setup() {
   }
 
   // Colores: uniforme gris oscuro para botones (sobrio)
-  colRun = colCounter = colCalibrate = colPlus = colMinus = tft.color565(80,80,80);
-  colNumberBg = tft.color565(16,16,16); // caja numero mas oscura
+  colRun = COLOR_ACCENT;
+  colCounter = COLOR_ACCENT_2;
+  colCalibrate = COLOR_BUTTON_BG;
+  colPlus = colMinus = COLOR_BUTTON_BG;
+  colNumberBg = COLOR_STATUS_BG; // caja numero mas oscura
 
   recomputeRects();
 
@@ -2241,6 +2416,11 @@ void loop() {
   // keep serving clients
   server.handleClient();
 
+  if (screen == IMAGE_VIEWER) {
+    handleImageViewerTouch();
+    return;
+  }
+
   // Si no hay toque, nada que hacer
   if (!ts.touched()) { delay(6); return; }
 
@@ -2265,6 +2445,7 @@ if (screen == HOME) {
   // Para HOME usamos un rect *interior* (inset) — solo clicks bien centrados activan el boton.
   if (ptInRectInner(sx, sy, btnRun, HOME_HIT_INSET)) touchedButton = 0;
   else if (ptInRectInner(sx, sy, btnCounter, HOME_HIT_INSET)) touchedButton = 1;
+  else if (ptInRectInner(sx, sy, btnImageMode, HOME_HIT_INSET)) touchedButton = 2;
 } else {
   // En pantalla COUNTER usamos un inset menor para +, -, number
   if (ptInRectInner(sx, sy, btnPlus, COUNTER_HIT_INSET)) touchedButton = 3;
@@ -2284,6 +2465,7 @@ if (screen == HOME) {
   activeButtonId = touchedButton;
   activeButtonRect = (activeButtonId == 0) ? btnRun
                  : (activeButtonId == 1) ? btnCounter
+                 : (activeButtonId == 2) ? btnImageMode
                  : (activeButtonId == 3) ? btnPlus
                  : (activeButtonId == 4) ? btnMinus
                  : btnNumber;
@@ -2293,6 +2475,7 @@ if (screen == HOME) {
   switch (activeButtonId) {
     case 0: flashButtonLocal(activeButtonRect, "RUN", colRun); break;
     case 1: flashButtonLocal(activeButtonRect, "Contador", colCounter); break;
+    case 2: flashButtonLocal(activeButtonRect, "IMG", colCalibrate); break;
     case 3: flashButtonLocal(activeButtonRect, "+", colPlus); break;
     case 4: flashButtonLocal(activeButtonRect, "-", colMinus); break;
     case 5: flashButtonLocal(activeButtonRect, "Enviar", colNumberBg); break;
@@ -2325,6 +2508,7 @@ if (screen == HOME) {
     switch (activeButtonId) {
       case 0: doPostRun(); break;
       case 1: screen = COUNTER; drawCounterFull(); break;
+      case 2: imgOffsetX = imgOffsetY = 0; clampImageOffsets(); drawImageViewer(); break;
       case 3: counterValue++; updateNumberDisplay(); break;
       case 4: counterValue--; updateNumberDisplay(); break;
       case 5: doPostTrigger(counterValue); delay(180); screen = HOME; drawHome(); break;
