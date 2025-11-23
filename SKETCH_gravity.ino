@@ -69,9 +69,15 @@ float map_scale_y = (float)115.0f / 4096.0f;
 float map_offset_y = 0.0f;
 bool calibrated = false;
 
-enum Screen { HOME, COUNTER };
+enum Screen { HOME, COUNTER, IMAGE_VIEWER };
 Screen screen = HOME;
 int counterValue = 0;
+
+// Imagen actual (para visor)
+int imgOffsetX = 0, imgOffsetY = 0;
+int lastImgW = 0, lastImgH = 0;
+String lastShownJpgPath = "";
+String lastUploadedJpgPath = "";
 
 // --- Long-press progress globals (insertar una vez con otros globals) ---
 float _lp_lastFrac = -1.0;          // fraccion previa para evitar redibujos innecesarios
@@ -93,7 +99,8 @@ int touchPressureThreshold = 0; // si tu TS devuelve z, puedes poner >0 para fil
 // --- fin globals ---
 
 struct Rect { int x, y, w, h; };
-Rect btnRun, btnCounter, btnPlus, btnMinus, btnNumber, btnCalibrate; // --- Pegar UNA SOLA VEZ junto a las otras declaraciones Rect (btnPlus/btnMinus/btnRun etc.) ---
+Rect btnRun, btnCounter, btnPlus, btnMinus, btnNumber, btnCalibrate, btnImageViewer; // --- Pegar UNA SOLA VEZ junto a las otras declaraciones Rect (btnPlus/btnMinus/btnRun etc.) ---
+Rect btnViewOpen, btnViewReset, btnViewBack;
 Rect btnLeftZone;
 Rect btnRightZone;
 
@@ -580,6 +587,64 @@ void drawHome() {
   // Solo RUN y Contador (sin Calibrar)
   redrawButton(btnRun, "PC", colRun);
   redrawButton(btnCounter, "PREG", colCounter);
+  redrawButton(btnImageViewer, "IMG", colCalibrate);
+}
+
+void drawViewerControlsOverlay(const char *statusMsg = nullptr) {
+  int barH = btnViewOpen.h + 12;
+  tft.fillRect(0, 0, tft.width(), barH, TFT_BLACK);
+  redrawButton(btnViewOpen, "Ult JPG", colRun);
+  redrawButton(btnViewReset, "Reset", colMinus);
+  redrawButton(btnViewBack, "Back", colCounter);
+
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  char buf[64];
+  snprintf(buf, sizeof(buf), "OffX:%d OffY:%d", imgOffsetX, imgOffsetY);
+  tft.drawCentreString(buf, tft.width()/2, barH - 10, 1);
+  if (statusMsg) {
+    tft.drawCentreString(statusMsg, tft.width()/2, barH + 8, 1);
+  }
+}
+
+void drawImageViewerScreen(bool redrawImage = true, const char *msg = nullptr) {
+  screen = IMAGE_VIEWER;
+  bool hasImage = (lastShownJpgPath.length() > 0) && SPIFFS.exists(lastShownJpgPath);
+  if (redrawImage && hasImage) {
+    displayJpgFile(lastShownJpgPath.c_str(), imgOffsetX, imgOffsetY, false);
+  } else if (!hasImage) {
+    tft.fillScreen(TFT_BLACK);
+  }
+  drawViewerControlsOverlay(msg);
+  if (!hasImage) {
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawCentreString("No hay JPG cargado", tft.width()/2, tft.height()/2 - 6, 1);
+  }
+}
+
+void resetImageOffsets() {
+  imgOffsetX = displayDefaultX;
+  imgOffsetY = displayDefaultY;
+  clampOffsetsToImage(imgOffsetX, imgOffsetY, lastImgW, lastImgH);
+  if (lastShownJpgPath.length() > 0 && SPIFFS.exists(lastShownJpgPath)) {
+    displayJpgFile(lastShownJpgPath.c_str(), imgOffsetX, imgOffsetY, false);
+    drawViewerControlsOverlay("Offsets reiniciados");
+  } else {
+    drawImageViewerScreen(false, "Sin imagen para reset");
+  }
+}
+
+void showLatestUploadedImage() {
+  String candidate = lastUploadedJpgPath.length() ? lastUploadedJpgPath : lastShownJpgPath;
+  if (candidate.length() == 0 || !SPIFFS.exists(candidate)) {
+    drawImageViewerScreen(false, "No hay JPG para abrir");
+    return;
+  }
+  imgOffsetX = displayDefaultX;
+  imgOffsetY = displayDefaultY;
+  displayJpgFile(candidate.c_str(), imgOffsetX, imgOffsetY, false);
+  drawViewerControlsOverlay("Abriendo ultimo JPG");
 }
 
 
@@ -652,6 +717,7 @@ uint16_t getBackgroundColorForScreen() {
   // Ajusta estos colores segun tu paleta y otras pantallas que tengas.
   if (screen == HOME) return TFT_BLACK;           // ajusta si tu HOME tiene otro fondo
   if (screen == COUNTER) return colNumberBg;      // usa color de la caja numerica
+  if (screen == IMAGE_VIEWER) return TFT_BLACK;
   // Ejemplo si tienes una pantalla RENDER con fondo claro:
   // if (screen == RENDER) return tft.color565(245,245,245);
   // Añade condiciones para otras pantallas con fondos especificos
@@ -1169,20 +1235,21 @@ void doPrevPage() {
 
 // ---------- RECTS helper ----------
 void recomputeRects() {
-  // Layout: dos botones centrados (RUN | Contador) con menor tamaño
+  // Layout: tres botones centrados (RUN | Contador | Visor)
   const int btnW = 90;    // ancho reducido
   const int btnH = 28;    // alto reducido
-  const int spacing = 18; // separacion entre botones
+  const int spacing = 14; // separacion entre botones
 
-  int totalW = btnW * 2 + spacing;
+  int totalW = btnW * 3 + spacing * 2;
   int startX = (V_W - totalW) / 2;
 
   // Posicion vertical (igual que antes para mantener diseño)
   int vyBtns = 74;
 
   // Botones principales centrados y mas pequeños
-  btnRun     = vRectMin(startX, vyBtns, btnW, btnH, 48);
-  btnCounter = vRectMin(startX + btnW + spacing, vyBtns, btnW, btnH, 48);
+  btnRun         = vRectMin(startX, vyBtns, btnW, btnH, 48);
+  btnCounter     = vRectMin(startX + btnW + spacing, vyBtns, btnW, btnH, 48);
+  btnImageViewer = vRectMin(startX + (btnW + spacing) * 2, vyBtns, btnW, btnH, 48);
 
   // Ocultar/eliminar Calibrar
   btnCalibrate = { 0, 0, 0, 0 };
@@ -1191,6 +1258,11 @@ void recomputeRects() {
   btnMinus  = vRectMin(12, 56, 38, 38, 48);
   btnPlus   = vRectMin(270, 56, 38, 38, 48);
   btnNumber = vRectMin(110, 72, 100, 44, 48);
+
+  // Controles del visor de imagen (barra superior)
+  btnViewOpen  = vRectMin(8, 6, 92, 26, 40);
+  btnViewReset = vRectMin(112, 6, 92, 26, 40);
+  btnViewBack  = vRectMin(216, 6, 92, 26, 40);
 
   // Zonas laterales (puedes aumentarlas si quieres más margen)
   const int widthSide = 72;
@@ -1209,6 +1281,24 @@ uint16_t hexTo565(const char *hex) {
   return (uint16_t)((r & 0xF8) << 8) | (uint16_t)((g & 0xFC) << 3) | (uint16_t)(b >> 3);
 }
 
+void clampOffsetsToImage(int &ox, int &oy, int imgW, int imgH) {
+  if (imgW <= 0 || imgH <= 0) return;
+
+  int baseX = (displayBaseMode == 0) ? (tft.width() - imgW) / 2 : 0;
+  int baseY = (displayBaseMode == 0) ? (tft.height() - imgH) / 2 : 0;
+
+  int minX = tft.width() - (baseX + imgW);
+  int maxX = -baseX;
+  int minY = tft.height() - (baseY + imgH);
+  int maxY = -baseY;
+
+  if (minX > maxX) { minX = maxX = 0; }
+  if (minY > maxY) { minY = maxY = 0; }
+
+  ox = constrain(ox, minX, maxX);
+  oy = constrain(oy, minY, maxY);
+}
+
 void displayJpgFile(const char *path, int xOffset = 0, int yOffset = 0, bool useDefaults = true) {
   if (!SPIFFS.exists(path)) {
     Serial.printf("⚠️ No existe el archivo JPG: %s\n", path);
@@ -1222,12 +1312,19 @@ void displayJpgFile(const char *path, int xOffset = 0, int yOffset = 0, bool use
   int imgH = JpegDec.height;
   Serial.printf("✅ Imagen decodificada: %dx%d. Mostrando (swapBytes=true)...\n", imgW, imgH);
 
+  lastImgW = imgW;
+  lastImgH = imgH;
+  lastShownJpgPath = String(path);
+
   int finalX = xOffset;
   int finalY = yOffset;
   if (useDefaults) {
     finalX = displayDefaultX;
     finalY = displayDefaultY;
   }
+  clampOffsetsToImage(finalX, finalY, imgW, imgH);
+  imgOffsetX = finalX;
+  imgOffsetY = finalY;
   uint16_t screenBg = hexTo565("000000");
   tft.fillScreen(screenBg);
   tft.setSwapBytes(true);
@@ -2021,6 +2118,7 @@ void handleUpload() {
   switch (upload.status) {
     case UPLOAD_FILE_START:
       currentFilenameUpload = "/" + upload.filename;
+      lastUploadedJpgPath = currentFilenameUpload;
       Serial.printf("📁 Iniciando subida: %s\n", currentFilenameUpload.c_str());
       uploadFile = SPIFFS.open(currentFilenameUpload, FILE_WRITE);
       if (!uploadFile) { Serial.println("❌ No se pudo crear el archivo en SPIFFS"); }
@@ -2033,6 +2131,7 @@ void handleUpload() {
         uploadFile.close();
         Serial.printf("✅ Archivo %s recibido, mostrando...\n", currentFilenameUpload.c_str());
         displayJpgFile(currentFilenameUpload.c_str());
+        lastUploadedJpgPath = currentFilenameUpload;
       }
       server.sendHeader("Location", "/");
       server.send(303);
@@ -2208,7 +2307,7 @@ void setup() {
 // ---- Versión canonical y segura de handleSideTouches ----
 bool handleSideTouches(int sx, int sy) {
   // Evita navegación lateral mientras estamos en el contador
-  if (screen == COUNTER) return false;
+  if (screen == COUNTER || screen == IMAGE_VIEWER) return false;
 
   unsigned long now = millis();
   // debounce para evitar múltiples activaciones rápidas
@@ -2257,6 +2356,68 @@ void loop() {
     return;
   }
 
+  if (screen == IMAGE_VIEWER) {
+    int viewerBtn = -1;
+    if (ptInRectInner(sx, sy, btnViewOpen, COUNTER_HIT_INSET)) viewerBtn = 10;
+    else if (ptInRectInner(sx, sy, btnViewReset, COUNTER_HIT_INSET)) viewerBtn = 11;
+    else if (ptInRectInner(sx, sy, btnViewBack, COUNTER_HIT_INSET)) viewerBtn = 12;
+
+    if (viewerBtn != -1) {
+      Rect r = (viewerBtn == 10) ? btnViewOpen : (viewerBtn == 11) ? btnViewReset : btnViewBack;
+      const char *label = (viewerBtn == 10) ? "Ult JPG" : (viewerBtn == 11) ? "Reset" : "Back";
+      uint16_t col = (viewerBtn == 10) ? colRun : (viewerBtn == 11) ? colMinus : colCounter;
+      flashButtonLocal(r, label, col);
+
+      int last_sx = sx, last_sy = sy;
+      int releaseConfirm = 0;
+      while (true) {
+        bool touchingNow = readFilteredTouch(last_sx, last_sy);
+        if (touchingNow) releaseConfirm = 0;
+        else { releaseConfirm++; if (releaseConfirm >= RELEASE_CONFIRM_COUNT) break; }
+        server.handleClient();
+        delay(8);
+      }
+      bool releasedInside = ptInRectPad(_touch_lastX, _touch_lastY, r, TAP_PAD_PIXELS);
+      if (releasedInside) {
+        if (viewerBtn == 10) showLatestUploadedImage();
+        else if (viewerBtn == 11) resetImageOffsets();
+        else if (viewerBtn == 12) { screen = HOME; drawHome(); }
+      }
+      delay(40);
+      while (ts.touched()) { server.handleClient(); delay(6); }
+      return;
+    }
+
+    if (lastShownJpgPath.length() == 0 || !SPIFFS.exists(lastShownJpgPath)) {
+      drawImageViewerScreen(false, "Sin imagen");
+      while (ts.touched()) { server.handleClient(); delay(6); }
+      return;
+    }
+
+    int startX = sx, startY = sy;
+    int baseOffX = imgOffsetX;
+    int baseOffY = imgOffsetY;
+    while (true) {
+      int curX = startX, curY = startY;
+      bool touchingNow = readFilteredTouch(curX, curY);
+      if (!touchingNow) break;
+
+      int newX = baseOffX + (curX - startX);
+      int newY = baseOffY + (curY - startY);
+      clampOffsetsToImage(newX, newY, lastImgW, lastImgH);
+      if (newX != imgOffsetX || newY != imgOffsetY) {
+        imgOffsetX = newX;
+        imgOffsetY = newY;
+        displayJpgFile(lastShownJpgPath.c_str(), imgOffsetX, imgOffsetY, false);
+        drawViewerControlsOverlay();
+      }
+      server.handleClient();
+      delay(8);
+    }
+    while (ts.touched()) { server.handleClient(); delay(6); }
+    return;
+  }
+
   // Determinar si el punto inicial esta sobre algun control (usando pad para ser tolerante)
  // Determinar si el punto inicial esta sobre algun control (hit-area interior para evitar accidentes)
 int touchedButton = -1;
@@ -2265,6 +2426,7 @@ if (screen == HOME) {
   // Para HOME usamos un rect *interior* (inset) — solo clicks bien centrados activan el boton.
   if (ptInRectInner(sx, sy, btnRun, HOME_HIT_INSET)) touchedButton = 0;
   else if (ptInRectInner(sx, sy, btnCounter, HOME_HIT_INSET)) touchedButton = 1;
+  else if (ptInRectInner(sx, sy, btnImageViewer, HOME_HIT_INSET)) touchedButton = 2;
 } else {
   // En pantalla COUNTER usamos un inset menor para +, -, number
   if (ptInRectInner(sx, sy, btnPlus, COUNTER_HIT_INSET)) touchedButton = 3;
@@ -2284,6 +2446,7 @@ if (screen == HOME) {
   activeButtonId = touchedButton;
   activeButtonRect = (activeButtonId == 0) ? btnRun
                  : (activeButtonId == 1) ? btnCounter
+                 : (activeButtonId == 2) ? btnImageViewer
                  : (activeButtonId == 3) ? btnPlus
                  : (activeButtonId == 4) ? btnMinus
                  : btnNumber;
@@ -2293,6 +2456,7 @@ if (screen == HOME) {
   switch (activeButtonId) {
     case 0: flashButtonLocal(activeButtonRect, "RUN", colRun); break;
     case 1: flashButtonLocal(activeButtonRect, "Contador", colCounter); break;
+    case 2: flashButtonLocal(activeButtonRect, "IMG", colCalibrate); break;
     case 3: flashButtonLocal(activeButtonRect, "+", colPlus); break;
     case 4: flashButtonLocal(activeButtonRect, "-", colMinus); break;
     case 5: flashButtonLocal(activeButtonRect, "Enviar", colNumberBg); break;
@@ -2325,6 +2489,7 @@ if (screen == HOME) {
     switch (activeButtonId) {
       case 0: doPostRun(); break;
       case 1: screen = COUNTER; drawCounterFull(); break;
+      case 2: drawImageViewerScreen(); break;
       case 3: counterValue++; updateNumberDisplay(); break;
       case 4: counterValue--; updateNumberDisplay(); break;
       case 5: doPostTrigger(counterValue); delay(180); screen = HOME; drawHome(); break;
